@@ -143,7 +143,7 @@ namespace Axinom.LiveStreamValidation
             // The playback window start is just an offset.
             var windowStart = windowEnd - manifest.PlaybackWindowLength;
 
-            feedback.Info($"Playback window is from {windowStart.ToTimeStringAccurate()} to {windowEnd.ToTimeStringAccurate()} ({manifest.PlaybackWindowLength.ToStringAccurate()})");
+            feedback.Info($"Playback window is from {windowStart.ToTimeStringAccurate()} to {windowEnd.ToTimeStringAccurate()} ({manifest.PlaybackWindowLength.ToStringAccurate()}). The manifest publish time is {manifest.PublishTime.ToTimeStringAccurate()} ({timeSincePublish.ToStringAccurate()} ago).");
 
             // First, check the period start/end itself, without bothering about segments.
             var firstPeriodStart = manifest.Periods.First().Start;
