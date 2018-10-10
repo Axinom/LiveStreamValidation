@@ -13,4 +13,6 @@ This is a PowerShell module that provides the `Test-LiveStream` command. You can
 
 # Usage
 
-1. `Test-LiveStream http://example.com/Manifest.mpd`
+1. `Test-LiveStream "http://example.com/Manifest.mpd" -Verbose`
+
+You can use the "-ManifestOutputPath" parameter to have the validator save a copy of the manifest as it sees it.
