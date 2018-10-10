@@ -8,9 +8,9 @@ using System.Xml;
 using System.Xml.Linq;
 
 // TODO: Leap second handling.
+// TODO: SuggestedPresentationDelay for playback window sizing.
+// TODO: Availability time adjustments.
 // TODO: SegmentTemplate without timeline.
-// TODO: More complex manifests.
-// TODO: More time sync methods.
 // TODO: Validate segment references.
 
 namespace Axinom.LiveStreamValidation
@@ -122,9 +122,28 @@ namespace Axinom.LiveStreamValidation
             //
             // Period durations are always sequentially correct because we fixup the durations on load (as should players).
 
-            var windowStart = now - manifest.PlaybackWindowLength;
+            // The playback window ends at the publish time (IOP v4.2 section 4.3.6).
+            // TODO: We should add SPD to this.
+            var windowEnd = manifest.PublishTime;
 
-            feedback.Info($"Playback window is from {windowStart.ToTimeStringAccurate()} to {now.ToTimeStringAccurate()} ({manifest.PlaybackWindowLength.ToStringAccurate()})");
+            // Some streams may have abnormal publish time. We need to detect this as an error.
+            var timeSincePublish = now - manifest.PublishTime;
+
+            if (timeSincePublish + Constants.TimingTolerance < TimeSpan.Zero)
+            {
+                feedback.InvalidContent($"The manifest says that it was published in the future ({manifest.PublishTime.ToStringAccurate()})!");
+            }
+            else if (timeSincePublish > Constants.ReasonablePublishTimeDistance)
+            {
+                feedback.InvalidContent($"The manifest says it was published unreasonably far in the past ({timeSincePublish} ago). DASH-IF IOP specifies that the publishTime value is used to detect the live edge (the end of the playback window), so using a value too far in the past means that recent content cannot be played. Timeline validation will ignore this dubious value and instead use the current time as the live edge.");
+
+                windowEnd = now;
+            }
+
+            // The playback window start is just an offset.
+            var windowStart = windowEnd - manifest.PlaybackWindowLength;
+
+            feedback.Info($"Playback window is from {windowStart.ToTimeStringAccurate()} to {windowEnd.ToTimeStringAccurate()} ({manifest.PlaybackWindowLength.ToStringAccurate()})");
 
             // First, check the period start/end itself, without bothering about segments.
             var firstPeriodStart = manifest.Periods.First().Start;
@@ -134,8 +153,8 @@ namespace Axinom.LiveStreamValidation
             var lastPeriodEnd = manifest.Periods.Last().End;
 
             if (lastPeriodEnd != null) // Might be infinite duration (almost always is).
-                if (lastPeriodEnd < now)
-                    feedback.InvalidContent($"There is a gap of {(now - lastPeriodEnd.Value).TotalMilliseconds:F1} ms between the end of the last period ({lastPeriodEnd.Value.ToTimeStringAccurate()}) and the end of the playback window ({now.ToTimeStringAccurate()}).");
+                if (lastPeriodEnd < windowEnd)
+                    feedback.InvalidContent($"There is a gap of {(windowEnd - lastPeriodEnd.Value).TotalMilliseconds:F1} ms between the end of the last period ({lastPeriodEnd.Value.ToTimeStringAccurate()}) and the end of the playback window ({windowEnd.ToTimeStringAccurate()}).");
 
             // Okay now run through each period individually and ensure it is fully covered by segments.
             // It is OK if periods have segments that go outside period boundaries - we ignore them.
@@ -153,7 +172,7 @@ namespace Axinom.LiveStreamValidation
                         var path = $"{period.Id}/{set.MimeType}";
                         feedback.Info($"Checking timeline of {path}.");
 
-                        CheckTimelineCoverage(set.SegmentTemplate, windowStart, now, path, feedback);
+                        CheckTimelineCoverage(set.SegmentTemplate, windowStart, windowEnd, path, feedback);
                     }
                     else
                     {
@@ -162,17 +181,17 @@ namespace Axinom.LiveStreamValidation
                             var path = $"{period.Id}/{set.MimeType}/{rep.Id}";
                             feedback.Info($"Checking timeline of {path}.");
 
-                            CheckTimelineCoverage(rep.SegmentTemplate, windowStart, now, path, feedback);
+                            CheckTimelineCoverage(rep.SegmentTemplate, windowStart, windowEnd, path, feedback);
                         }
                     }
                 }
             }
         }
 
-        private static void CheckTimelineCoverage(SegmentTemplate template, DateTimeOffset windowStart, DateTimeOffset now, string path, IFeedbackSink feedback)
+        private static void CheckTimelineCoverage(SegmentTemplate template, DateTimeOffset windowStart, DateTimeOffset windowEnd, string path, IFeedbackSink feedback)
         {
             var period = template.ResolveAdaptationSet().Period;
-            var periodTimingString = $"The period lasts from {period.Start.ToTimeStringAccurate()} to {(period.End ?? now).ToTimeStringAccurate()}.";
+            var periodTimingString = $"The period lasts from {period.Start.ToTimeStringAccurate()} to {(period.End ?? windowEnd).ToTimeStringAccurate()}.";
 
             var contentExistsUpTo = period.Start;
 
@@ -205,8 +224,9 @@ namespace Axinom.LiveStreamValidation
                 }
 
                 // If the segment is entirely in the future, skip it.
-                // This is expected if the period is cut short by the next period.
-                if (period.End.HasValue && segment.Start > period.End)
+                // This can be either because this period was cut short by a new period
+                // or because this is the last period and the described segment is not available yet.
+                if (segment.Start > (period.End ?? windowEnd))
                 {
                     ignoredFutureSegments++;
                     continue;
@@ -232,10 +252,10 @@ namespace Axinom.LiveStreamValidation
             else
             {
                 // Make sure we covered the period until playback window end if we do not know period end.
-                if (contentExistsUpTo < now)
+                if (contentExistsUpTo < windowEnd)
                 {
-                    var gapLength = now - contentExistsUpTo;
-                    feedback.InvalidContent($"There is a gap of {gapLength.TotalMilliseconds:F1} ms from {contentExistsUpTo.ToTimeStringAccurate()} to {now.ToTimeStringAccurate()}. {periodTimingString} This gap is at the end of the period.");
+                    var gapLength = windowEnd - contentExistsUpTo;
+                    feedback.InvalidContent($"There is a gap of {gapLength.TotalMilliseconds:F1} ms from {contentExistsUpTo.ToTimeStringAccurate()} to {windowEnd.ToTimeStringAccurate()}. {periodTimingString} This gap is at the end of the period.");
                 }
             }
 
@@ -266,6 +286,9 @@ namespace Axinom.LiveStreamValidation
 
             if (xml.Root.Attribute("type")?.Value != "dynamic")
                 throw new NotSupportedException("MPD@type must be 'dynamic'");
+
+            if (manifest.PublishTime.Year < 2018)
+                throw new NotSupportedException("MPD@availabilityStartTime must be at least in 2018 because this validator does not yet implement leap second processing.");
 
             foreach (var clockSyncElement in xml.Root.Elements(UtcTimingName))
             {
