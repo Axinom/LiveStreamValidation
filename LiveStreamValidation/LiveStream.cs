@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
@@ -18,9 +17,6 @@ namespace Axinom.LiveStreamValidation
 {
     public static class LiveStream
     {
-        // We expect everything to be fast.
-        private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(5);
-
         private const string MpdNamespace = "urn:mpeg:dash:schema:mpd:2011";
 
         private static readonly XName PeriodName = XName.Get("Period", MpdNamespace);
@@ -48,12 +44,11 @@ namespace Axinom.LiveStreamValidation
 
             using (var client = new HttpClient
             {
-                Timeout = RequestTimeout
+                Timeout = Constants.HttpRequestTimeout
             })
             {
                 feedback.Info($"Downloading manifest from {manifestUrl}");
                 var manifestResponse = client.GetAsync(manifestUrl).GetAwaiter().GetResult();
-                    ;
                 manifestResponse.EnsureSuccessStatusCode();
 
                 var manifestString = manifestResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult();
@@ -72,18 +67,27 @@ namespace Axinom.LiveStreamValidation
                 // During this, we may already encounter some errors/warnings - this is fine, we want to scream all we can.
                 var manifest = LoadManifest(manifestString, feedback);
 
-                if (manifest.HttpIsoTimeSyncUrl == null)
-                    throw new NotSupportedException("The live stream manifest must define a supported method for clock synchronization. This validator supports the following clock synchronization modes: http-iso.");
+                if (manifest.TimeSources.Count == 0)
+                    throw new NotSupportedException("The live stream manifest must define a supported method for clock synchronization. This validator supports the following clock synchronization modes: http-iso, http-head, direct.");
 
-                var timeSyncResponse = client.GetStringAsync(manifest.HttpIsoTimeSyncUrl).GetAwaiter().GetResult();
+                if (manifest.TimeSources.Count > 1)
+                    feedback.WillSkipSomeData("Multiple clock synchronization sources methods are present in the manifest. This validator will only use the first one listed.");
 
-                var timeSyncTimestamp = DateTimeOffset.Parse(timeSyncResponse, CultureInfo.InvariantCulture);
-                feedback.Info($"Clock synchronized from time server. Current time is {timeSyncTimestamp.ToTimeStringAccurate()}.");
+                var timeSource = manifest.TimeSources.First();
+                var synchronizedTime = timeSource.GetTimeAsync().GetAwaiter().GetResult();
+                feedback.Info($"Clock synchronized ({timeSource.Name}). Current time is {synchronizedTime.ToTimeStringAccurate()}.");
 
-                // We subtract time since download, since our "now" for the manifest is a bit in the past already.
-                manifestDownloadTimestamp = timeSyncTimestamp - timeSinceDownload.Elapsed;
+                if (timeSource.IsStaticValue)
+                {
+                    manifestDownloadTimestamp = synchronizedTime;
+                }
+                else
+                {
+                    // We subtract time since download, since our "now" for the manifest is a bit in the past already.
+                    manifestDownloadTimestamp = synchronizedTime - timeSinceDownload.Elapsed;
+                }
 
-                feedback.Info($"Manifest was downloaded at {manifestDownloadTimestamp.ToTimeStringAccurate()}. This timestamp will be used as 'now' when calculating ");
+                feedback.Info($"Manifest was downloaded at {manifestDownloadTimestamp.ToTimeStringAccurate()}. This timestamp will be used as 'now' when calculating the playback window.");
 
                 var periodsList = string.Join(Environment.NewLine, manifest.Periods.Select(p => $"{p.Id ?? "unknown"} from {p.Start.ToTimeStringAccurate()} to {(p.End ?? manifestDownloadTimestamp).ToTimeStringAccurate()}."));
                 feedback.Info($"Loaded manifest with {manifest.Periods.Count} periods:{Environment.NewLine}{periodsList}");
@@ -265,14 +269,20 @@ namespace Axinom.LiveStreamValidation
 
             foreach (var clockSyncElement in xml.Root.Elements(UtcTimingName))
             {
-                if (clockSyncElement.Attribute("schemeIdUri").Value == "urn:mpeg:dash:utc:http-iso:2014")
+                switch (clockSyncElement.Attribute("schemeIdUri").Value)
                 {
-                    // Theoretically, there could be multiple URLs but we will just accept latest
-                    // because having a single URL is the common case in practice.
-                    if (manifest.HttpIsoTimeSyncUrl != null)
-                        feedback.WillSkipSomeData("Multiple time sync URLs are present in the manifest. This validator will only use the last one listed.");
-
-                    manifest.HttpIsoTimeSyncUrl = new Uri(clockSyncElement.Attribute("value").Value, UriKind.Absolute);
+                    case "urn:mpeg:dash:utc:http-iso:2014":
+                        manifest.TimeSources.Add(new HttpIsoTimeSource(new Uri(clockSyncElement.Attribute("value").Value, UriKind.Absolute)));
+                        break;
+                    case "urn:mpeg:dash:utc:http-head:2014":
+                        manifest.TimeSources.Add(new HttpHeadTimeSource(new Uri(clockSyncElement.Attribute("value").Value, UriKind.Absolute)));
+                        break;
+                    case "urn:mpeg:dash:utc:direct:2014":
+                        manifest.TimeSources.Add(new DirectTimeSource(clockSyncElement.Attribute("value").Value));
+                        break;
+                    default:
+                        feedback.WillSkipSomeData("Ignoring unsupported clock synchromization method: " + clockSyncElement.Attribute("schemeIdUri").Value);
+                        break;
                 }
             }
 
@@ -385,11 +395,17 @@ namespace Axinom.LiveStreamValidation
                 Element = element,
 
                 Timescale = element.GetAttributeAsInt64("timescale"),
-                RawPresentationTimeOffset = element.GetAttributeAsInt64("presentationTimeOffset"),
 
                 InitUrlTemplate = element.GetAttributeAsString("initialization"),
                 SegmentUrlTemplate = element.GetAttributeAsString("media")
             };
+
+            // PTO is optional, defaults to 0.
+            if (element.Attribute("presentationTimeOffset") != null)
+                template.RawPresentationTimeOffset = element.GetAttributeAsInt64("presentationTimeOffset");
+
+            // Segment start time is optional, starts at 0 and then just += duration.
+            long nextRawStart = 0;
 
             foreach (var segmentElement in element.Elements(SegmentTimelineName).Elements(SegmentName))
             {
@@ -406,10 +422,20 @@ namespace Axinom.LiveStreamValidation
                         SegmentTemplate = template,
 
                         RawDuration = segmentElement.GetAttributeAsInt64("d"),
-                        RawStart = segmentElement.GetAttributeAsInt64("t")
                     };
 
-                    segment.RawStart += segment.RawDuration * i;
+                    if (segmentElement.Attribute("t") != null && repeat == 0)
+                    {
+                        // We only take "t" on the first iteration of a repeat.
+                        // Within a repeated cycle, we just use nextRawStart as if "t" were not there.
+                        segment.RawStart = segmentElement.GetAttributeAsInt64("t");
+                    }
+                    else
+                    {
+                        segment.RawStart = nextRawStart;
+                    }
+
+                    nextRawStart = segment.RawStart + segment.RawDuration;
 
                     template.Segments.Add(segment);
                 }
@@ -429,8 +455,8 @@ namespace Axinom.LiveStreamValidation
             public TimeSpan PlaybackWindowLength;
             public TimeSpan ManifestRefreshInterval;
 
-            // If using http-iso method.
-            public Uri HttpIsoTimeSyncUrl;
+            // TODO: Validate that the time sync sources are not out of sync if multiple are used?
+            public IList<ITimeSource> TimeSources = new List<ITimeSource>();
 
             public IList<Period> Periods = new List<Period>();
         }
