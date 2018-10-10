@@ -89,7 +89,7 @@ PrivateData = @{
             # Automated build scripts will look for this. Content of the field does not matter.
             # If there is any non-empty string in there, the package will be published as prerelease
             # and an auto-incrementing suffix will be used to ensure that each build is numbered right.
-            Prerelease = 'yes'
+            Prerelease = ''
 
             # Tags applied to this module. These help with module discovery in online galleries.
             Tags = @('dash', 'hls', 'stream', 'video', 'validation', 'validate', 'validator', 'mpeg')
